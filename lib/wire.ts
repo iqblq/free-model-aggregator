@@ -106,11 +106,80 @@ function argumentsOf(value: unknown): Json {
 }
 
 /** OpenAI's finish_reason as Anthropic's stop_reason. */
+const OPENAI_STOP_REASON: Record<string, string> = {
+  length: 'max_tokens',
+  tool_calls: 'tool_use',
+  function_call: 'tool_use',
+  content_filter: 'refusal',
+};
+
 export function stopReasonOf(finish: unknown): string {
-  if (finish === 'length') return 'max_tokens';
-  if (finish === 'tool_calls' || finish === 'function_call') return 'tool_use';
-  if (finish === 'content_filter') return 'refusal';
-  return 'end_turn';
+  if (typeof finish !== 'string') return 'end_turn';
+  return OPENAI_STOP_REASON[finish] ?? 'end_turn';
+}
+
+/** One Anthropic assistant turn's text and tool calls, as OpenAI writes them. */
+function anthropicAssistantTurnOf(content: unknown[]): { text: string; toolCalls: Json[] } {
+  const toolCalls: Json[] = [];
+  for (const block of content) {
+    if (!isRecord(block) || block.type !== 'tool_use') continue;
+    toolCalls.push({
+      id: typeof block.id === 'string' ? block.id : '',
+      type: 'function',
+      function: {
+        name: typeof block.name === 'string' ? block.name : '',
+        arguments: JSON.stringify(isRecord(block.input) ? block.input : {}),
+      },
+    });
+  }
+  return { text: textOf(content), toolCalls };
+}
+
+/** One Anthropic user turn's tool messages and content parts, in the order the blocks gave them. */
+function anthropicUserTurnOf(content: unknown[]): { toolMessages: Json[]; parts: Json[] } {
+  const toolMessages: Json[] = [];
+  const parts: Json[] = [];
+  for (const block of content) {
+    if (!isRecord(block)) continue;
+    if (block.type === 'tool_result') {
+      toolMessages.push({
+        role: 'tool',
+        tool_call_id: typeof block.tool_use_id === 'string' ? block.tool_use_id : '',
+        content: toolResultText(block.content),
+      });
+      continue;
+    }
+    const part = partOf(block);
+    if (part !== null) parts.push(part);
+  }
+  return { toolMessages, parts };
+}
+
+/** An Anthropic tool list as OpenAI function tools, or [] when it names none. */
+function openAIToolsOf(tools: unknown): Json[] {
+  if (!Array.isArray(tools)) return [];
+  return tools.flatMap((raw) => {
+    if (!isRecord(raw) || typeof raw.name !== 'string') return [];
+    return [
+      {
+        type: 'function',
+        function: {
+          name: raw.name,
+          description: typeof raw.description === 'string' ? raw.description : '',
+          parameters: isRecord(raw.input_schema) ? raw.input_schema : { type: 'object', properties: {} },
+        },
+      },
+    ];
+  });
+}
+
+/** An Anthropic tool_choice as OpenAI's, or null when it asks for nothing. */
+function openAIToolChoiceOf(choice: unknown): Json | string | null {
+  if (!isRecord(choice)) return null;
+  if (choice.type === 'auto') return 'auto';
+  if (choice.type === 'any') return 'required';
+  if (choice.type === 'tool' && typeof choice.name === 'string') return { type: 'function', function: { name: choice.name } };
+  return null;
 }
 
 /**
@@ -134,41 +203,17 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
     }
     if (!Array.isArray(content)) continue;
     if (assistant) {
-      const toolCalls: Json[] = [];
-      for (const block of content) {
-        if (!isRecord(block) || block.type !== 'tool_use') continue;
-        toolCalls.push({
-          id: typeof block.id === 'string' ? block.id : '',
-          type: 'function',
-          function: {
-            name: typeof block.name === 'string' ? block.name : '',
-            arguments: JSON.stringify(isRecord(block.input) ? block.input : {}),
-          },
-        });
-      }
-      const text = textOf(content);
+      const turn = anthropicAssistantTurnOf(content);
       messages.push({
         role: 'assistant',
-        content: text !== '' ? text : null,
-        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+        content: turn.text !== '' ? turn.text : null,
+        ...(turn.toolCalls.length > 0 ? { tool_calls: turn.toolCalls } : {}),
       });
       continue;
     }
-    const parts: Json[] = [];
-    for (const block of content) {
-      if (!isRecord(block)) continue;
-      if (block.type === 'tool_result') {
-        messages.push({
-          role: 'tool',
-          tool_call_id: typeof block.tool_use_id === 'string' ? block.tool_use_id : '',
-          content: toolResultText(block.content),
-        });
-        continue;
-      }
-      const part = partOf(block);
-      if (part !== null) parts.push(part);
-    }
-    if (parts.length > 0) messages.push({ role: 'user', content: parts });
+    const turn = anthropicUserTurnOf(content);
+    for (const toolMessage of turn.toolMessages) messages.push(toolMessage);
+    if (turn.parts.length > 0) messages.push({ role: 'user', content: turn.parts });
   }
 
   const out: Json = { model, messages };
@@ -176,28 +221,10 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
   if (typeof body.temperature === 'number') out.temperature = body.temperature;
   if (typeof body.top_p === 'number') out.top_p = body.top_p;
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length > 0) out.stop = body.stop_sequences;
-  if (Array.isArray(body.tools)) {
-    const tools = body.tools.flatMap((raw) => {
-      if (!isRecord(raw) || typeof raw.name !== 'string') return [];
-      return [
-        {
-          type: 'function',
-          function: {
-            name: raw.name,
-            description: typeof raw.description === 'string' ? raw.description : '',
-            parameters: isRecord(raw.input_schema) ? raw.input_schema : { type: 'object', properties: {} },
-          },
-        },
-      ];
-    });
-    if (tools.length > 0) out.tools = tools;
-  }
-  const choice = body.tool_choice;
-  if (isRecord(choice)) {
-    if (choice.type === 'auto') out.tool_choice = 'auto';
-    else if (choice.type === 'any') out.tool_choice = 'required';
-    else if (choice.type === 'tool' && typeof choice.name === 'string') out.tool_choice = { type: 'function', function: { name: choice.name } };
-  }
+  const tools = openAIToolsOf(body.tools);
+  if (tools.length > 0) out.tools = tools;
+  const toolChoice = openAIToolChoiceOf(body.tool_choice);
+  if (toolChoice !== null) out.tool_choice = toolChoice;
   if (body.stream === true) {
     out.stream = true;
     out.stream_options = { include_usage: true };
@@ -415,25 +442,38 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
 // ---------------------------------------------------------------------------
 
 /** A Gemini finishReason as an OpenAI finish_reason. The provider always answers STOP. */
+const GEMINI_FINISH_TO_OPENAI: Record<string, string> = {
+  MAX_TOKENS: 'length',
+  SAFETY: 'content_filter',
+  TOOL_CALLS: 'tool_calls',
+};
+
 export function geminiFinishToOpenAI(finish: unknown): string {
-  if (finish === 'MAX_TOKENS') return 'length';
-  if (finish === 'SAFETY') return 'content_filter';
-  if (finish === 'TOOL_CALLS') return 'tool_calls';
-  return 'stop';
+  if (typeof finish !== 'string') return 'stop';
+  return GEMINI_FINISH_TO_OPENAI[finish] ?? 'stop';
 }
 
 /** A Gemini finishReason as an Anthropic stop_reason. The provider always answers STOP. */
+const GEMINI_FINISH_TO_ANTHROPIC: Record<string, string> = {
+  MAX_TOKENS: 'max_tokens',
+  SAFETY: 'refusal',
+  TOOL_CALLS: 'tool_use',
+};
+
 export function geminiFinishToAnthropic(finish: unknown): string {
-  if (finish === 'MAX_TOKENS') return 'max_tokens';
-  if (finish === 'SAFETY') return 'refusal';
-  if (finish === 'TOOL_CALLS') return 'tool_use';
-  return 'end_turn';
+  if (typeof finish !== 'string') return 'end_turn';
+  return GEMINI_FINISH_TO_ANTHROPIC[finish] ?? 'end_turn';
+}
+
+/** A Gemini response's first candidate, or {} when it has none. */
+function firstCandidateOf(body: Json): Json {
+  const candidates = Array.isArray(body.candidates) ? body.candidates : [];
+  return isRecord(candidates[0]) ? candidates[0] : {};
 }
 
 /** The text of a Gemini response's first candidate, its parts joined. */
 export function geminiText(body: Json): string {
-  const candidates = Array.isArray(body.candidates) ? body.candidates : [];
-  const first = isRecord(candidates[0]) ? candidates[0] : {};
+  const first = firstCandidateOf(body);
   const content = isRecord(first.content) ? first.content : {};
   const parts = Array.isArray(content.parts) ? content.parts : [];
   return parts.flatMap((p) => (isRecord(p) && typeof p.text === 'string' ? [p.text] : [])).join('');
@@ -451,8 +491,7 @@ export function geminiUsage(body: Json): { input: number; output: number } | nul
 
 /** A Gemini response's finishReason, or null. */
 export function geminiFinish(body: Json): string | null {
-  const candidates = Array.isArray(body.candidates) ? body.candidates : [];
-  const first = isRecord(candidates[0]) ? candidates[0] : {};
+  const first = firstCandidateOf(body);
   return typeof first.finishReason === 'string' ? first.finishReason : null;
 }
 
@@ -614,20 +653,20 @@ export function anthropicToGemini(body: Json): Json {
 
 /** A Gemini answer as an OpenAI Chat Completions object. `model` is the model that answered. */
 export function geminiToOpenAI(body: Json, model: string): Json {
-  const usage = geminiUsage(body);
+  const counts = usageCounts(geminiUsage(body));
   return {
     id: 'chatcmpl-agg',
     object: 'chat.completion',
     created: FIXED_OPENAI_CREATED,
     model,
     choices: [{ index: 0, message: { role: 'assistant', content: geminiText(body) }, finish_reason: geminiFinishToOpenAI(geminiFinish(body)), logprobs: null }],
-    usage: usage === null ? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } : { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.input + usage.output },
+    usage: { prompt_tokens: counts.input, completion_tokens: counts.output, total_tokens: counts.input + counts.output },
   };
 }
 
 /** A Gemini answer as an Anthropic Messages object. `model` is the model that answered. */
 export function geminiToAnthropic(body: Json, model: string): Json {
-  const usage = geminiUsage(body);
+  const counts = usageCounts(geminiUsage(body));
   return {
     id: 'msg_agg',
     type: 'message',
@@ -636,8 +675,17 @@ export function geminiToAnthropic(body: Json, model: string): Json {
     content: [{ type: 'text', text: geminiText(body) }],
     stop_reason: geminiFinishToAnthropic(geminiFinish(body)),
     stop_sequence: null,
-    usage: usage === null ? { input_tokens: 0, output_tokens: 0 } : { input_tokens: usage.input, output_tokens: usage.output },
+    usage: { input_tokens: counts.input, output_tokens: counts.output },
   };
+}
+
+/** The `data:` payloads one SSE frame's lines carry, in order. */
+function payloadsInFrame(frame: string): string[] {
+  const out: string[] = [];
+  for (const line of frame.split('\n')) {
+    if (line.startsWith('data:')) out.push(line.slice(5).trim());
+  }
+  return out;
 }
 
 /** Read a whole SSE body and return its frames' data payloads, in order. */
@@ -655,18 +703,12 @@ async function ssePayloads(stream: ReadableStream<Uint8Array>): Promise<string[]
       while (at !== -1) {
         const frame = buffer.slice(0, at);
         buffer = buffer.slice(at + 2);
-        for (const line of frame.split('\n')) {
-          if (line.startsWith('data:')) payloads.push(line.slice(5).trim());
-        }
+        payloads.push(...payloadsInFrame(frame));
         at = buffer.indexOf('\n\n');
       }
     }
     buffer += decoder.decode();
-    if (buffer.trim() !== '') {
-      for (const line of buffer.split('\n')) {
-        if (line.startsWith('data:')) payloads.push(line.slice(5).trim());
-      }
-    }
+    if (buffer.trim() !== '') payloads.push(...payloadsInFrame(buffer));
   } finally {
     reader.releaseLock();
   }
@@ -685,6 +727,24 @@ function geminiFrameOf(payload: string): { text: string; finish: string | null; 
   return { text: geminiText(value), finish: geminiFinish(value), usage: geminiUsage(value) };
 }
 
+/** One Gemini stream frame's pieces. */
+type GeminiFrame = { text: string; finish: string | null; usage: { input: number; output: number } | null };
+
+/** A stream's payloads as their frames, skipping the ones that do not parse. */
+function geminiFramesOf(payloads: string[]): GeminiFrame[] {
+  const frames: GeminiFrame[] = [];
+  for (const payload of payloads) {
+    const frame = geminiFrameOf(payload);
+    if (frame !== null) frames.push(frame);
+  }
+  return frames;
+}
+
+/** A usage pair, or zeros when the answer carried none. */
+function usageCounts(usage: { input: number; output: number } | null): { input: number; output: number } {
+  return usage === null ? { input: 0, output: 0 } : usage;
+}
+
 /**
  * A Gemini stream as the OpenAI event sequence: a role chunk, the content pieces, one finish chunk, the
  * usage chunk (choices empty, as the OpenAI wire sends it) and [DONE]. The whole stream is read first:
@@ -697,9 +757,7 @@ export async function openAIEventsFromGemini(stream: ReadableStream<Uint8Array>,
   events.push(sseEvent(null, chunk({ role: 'assistant', content: '' }, null)));
   let finish: string | null = null;
   let usage: { input: number; output: number } | null = null;
-  for (const payload of payloads) {
-    const frame = geminiFrameOf(payload);
-    if (frame === null) continue;
+  for (const frame of geminiFramesOf(payloads)) {
     if (frame.text !== '') events.push(sseEvent(null, chunk({ content: frame.text }, null)));
     if (frame.finish !== null) finish = frame.finish;
     if (frame.usage !== null) usage = frame.usage;
@@ -724,26 +782,23 @@ export async function anthropicEventsFromGemini(stream: ReadableStream<Uint8Arra
   let text = '';
   let finish: string | null = null;
   let usage: { input: number; output: number } | null = null;
-  for (const payload of payloads) {
-    const frame = geminiFrameOf(payload);
-    if (frame === null) continue;
+  for (const frame of geminiFramesOf(payloads)) {
     text += frame.text;
     if (frame.finish !== null) finish = frame.finish;
     if (frame.usage !== null) usage = frame.usage;
   }
-  const input = usage === null ? 0 : usage.input;
-  const output = usage === null ? 0 : usage.output;
+  const counts = usageCounts(usage);
   const events: string[] = [
     sseEvent('message_start', {
       type: 'message_start',
-      message: { id: 'msg_agg', type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: input, output_tokens: 0 } },
+      message: { id: 'msg_agg', type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: counts.input, output_tokens: 0 } },
     }),
     sseEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
   ];
   if (text !== '') events.push(sseEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } }));
   events.push(
     sseEvent('content_block_stop', { type: 'content_block_stop', index: 0 }),
-    sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: geminiFinishToAnthropic(finish), stop_sequence: null }, usage: { output_tokens: output } }),
+    sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: geminiFinishToAnthropic(finish), stop_sequence: null }, usage: { output_tokens: counts.output } }),
     sseEvent('message_stop', { type: 'message_stop' }),
   );
   return events.join('');

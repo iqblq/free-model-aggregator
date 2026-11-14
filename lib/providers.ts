@@ -1,31 +1,36 @@
-// The brief's three documents and the catalog probe.
+// How a trial's brief is read, and how the catalog is probed.
 //
-// A trial's brief (the path in MAKEFUN_PROMPT_FILE) carries three JSON documents, and the prose around
-// them does not matter: this file finds each by its `schema` member.
+// The brief (the file MAKEFUN_PROMPT_FILE names) holds three JSON documents
+// buried in prose; this file pulls each one out by its `schema` string:
 //
-//   - the provider directory (`free-model-aggregator-01/providers/v1`): one row a provider, with its id,
-//     its wire, its auth scheme, the environment variable a real deployment would read the key from, the
-//     key the simulated service takes, and the base path the entry joins to MAKEFUN_ENV_URL. A directory
-//     entry may give an absolute base_url instead of a path; joinBase takes either.
-//   - the quality table (`free-model-aggregator-01/ratings/v1`): each model's public rating in
-//     milli-points, what it can do (tools, vision, JSON mode, context length) and whether it is free. The
-//     scorer ranks an answer by its rating; a paid model is never a legal pick. This baseline reads the
-//     table's capability columns and free flag (the sealed truth, where a row exists) but never its
-//     rating (`--list` shows why in main.ts's header, and the routing TODO there names the gap).
-//   - the workload manifest (`free-model-aggregator-01/workload/v1`): the requests the client will send,
-//     in order, each with its api, whether it streams, its weight and the requirements a model must meet
-//     to serve it.
+//   - the provider directory (`free-model-aggregator-01/providers/v1`): a row
+//     per provider — its id, its wire, how it takes a key, the environment
+//     variable a real deployment would read the key from, the key the
+//     simulated service accepts, and the base path the entry joins onto
+//     MAKEFUN_ENV_URL. A directory row may spell an absolute base_url
+//     instead of a path; joinBase accepts either.
+//   - the quality table (`free-model-aggregator-01/ratings/v1`): every
+//     model's public rating in milli-points, what it can do (tools, vision,
+//     JSON mode, context length) and whether it is free. The scorer ranks an
+//     answer by rating; a paid model is never a legal pick. This baseline
+//     reads the table's capability columns and free flag (the sealed truth,
+//     where a row exists) but never its rating (`--list` shows why in
+//     main.ts's header, and the routing TODO there names the gap).
+//   - the workload manifest (`free-model-aggregator-01/workload/v1`): the
+//     requests the client will send, in order, each with its api, whether it
+//     streams, its weight, and the requirements a model must meet to serve it.
 //
-// It then probes each provider's catalog route in the provider's own wire:
+// Each provider's catalog route is then probed in the provider's own wire:
 //
 //   openai     GET <base>/v1/models          Authorization: Bearer <key>
 //   anthropic  GET <base>/v1/models          x-api-key: <key>, anthropic-version: 2023-06-01
 //   gemini     GET <base>/v1beta/models      x-goog-api-key: <key>
 //
-// A probe that fails (a refused connection, a non-2xx, a body that is not JSON) leaves its provider out of
-// the catalog and gets no traffic; the trial goes on. Everything here is deterministic: no clock, no
-// randomness, so `node main.ts --list` and the register body build the same document (main.ts prints or
-// posts this one object).
+// A probe that fails — a refused connection, a non-2xx status, a body that is
+// not JSON — leaves its provider out of the catalog and the provider gets no
+// traffic; the trial goes on. Nothing here depends on the clock or on chance,
+// so `node main.ts --list` and the body posted to /register are the same
+// document (main.ts prints or posts this one object).
 
 import { readFileSync } from 'node:fs';
 
@@ -149,57 +154,112 @@ export interface Capabilities {
   json: boolean | null;
 }
 
+/** The first of the given strings that is not empty, or '' when all of them are. */
+function firstNonEmpty(...values: string[]): string {
+  for (const value of values) {
+    if (value !== '') return value;
+  }
+  return '';
+}
+
+/** The first of the given values that is neither null nor undefined, or null when there is none. */
+function prefer<T>(...values: (T | null | undefined)[]): T | null {
+  for (const value of values) {
+    if (value !== null && value !== undefined) return value;
+  }
+  return null;
+}
+
+/** Whether `v` is exactly the boolean true (anything else is not a yes). */
+function isTrue(v: unknown): boolean {
+  return v === true;
+}
+
 /** A base path joined to the env's URL; an absolute base_url is used as it stands. */
 export function joinBase(envUrl: string, base: string): string {
-  const b = base.trim();
-  if (/^https?:\/\//i.test(b)) return b.replace(/\/+$/, '');
-  const prefix = envUrl.replace(/\/+$/, '');
-  if (b === '') return prefix;
-  return `${prefix}${b.startsWith('/') ? '' : '/'}${b.replace(/\/+$/, '')}`;
+  const trimmed = base.trim();
+  if (/^https?:\/\//i.test(trimmed)) return stripTrailingSlashes(trimmed);
+  const prefix = stripTrailingSlashes(envUrl);
+  if (trimmed === '') return prefix;
+  const path = stripTrailingSlashes(trimmed);
+  return `${prefix}${path.startsWith('/') ? '' : '/'}${path}`;
 }
+
+/** `s` with every trailing slash removed. */
+function stripTrailingSlashes(s: string): string {
+  return s.replace(/\/+$/, '');
+}
+
+/** The header name a provider's auth scheme puts its key under, if it uses one. */
+const AUTH_HEADER_NAME: Record<AuthScheme, string | undefined> = {
+  bearer: 'authorization',
+  'x-api-key': 'x-api-key',
+  'x-goog-api-key': 'x-goog-api-key',
+  none: undefined,
+};
 
 /** The headers a provider wants its key in. */
 export function authHeaders(auth: AuthScheme, key: string): Record<string, string> {
   if (key === '') return {};
-  if (auth === 'bearer') return { authorization: `Bearer ${key}` };
-  if (auth === 'x-api-key') return { 'x-api-key': key };
-  if (auth === 'x-goog-api-key') return { 'x-goog-api-key': key };
-  return {};
+  const name = AUTH_HEADER_NAME[auth];
+  if (name === undefined) return {};
+  return { [name]: auth === 'bearer' ? `Bearer ${key}` : key };
 }
 
 /** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
 function documentsIn(text: string): Json[] {
-  const out: Json[] = [];
-  for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
+  const found: Json[] = [];
+  let start = text.indexOf('{');
+  while (start !== -1) {
     const end = objectEnd(text, start);
-    if (end === -1) continue;
-    try {
-      const value: unknown = JSON.parse(text.slice(start, end + 1));
-      if (isRecord(value) && typeof value.schema === 'string') out.push(value);
-    } catch {
-      // Not JSON on its own: look on.
+    if (end !== -1) {
+      try {
+        const value: unknown = JSON.parse(text.slice(start, end + 1));
+        if (isRecord(value) && typeof value.schema === 'string') found.push(value);
+      } catch {
+        // Not JSON on its own: look on.
+      }
     }
+    start = text.indexOf('{', start + 1);
   }
-  return out;
+  return found;
 }
 
 /** The index of the `}` closing the object that opens at `start`, or -1; string contents are skipped. */
 function objectEnd(text: string, start: number): number {
   let depth = 0;
-  let inString = false;
   for (let i = start; i < text.length; i++) {
     const ch = text[i];
-    if (inString) {
-      if (ch === '\\') i += 1;
-      else if (ch === '"') inString = false;
-    } else if (ch === '"') inString = true;
-    else if (ch === '{') depth += 1;
+    if (ch === '"') {
+      i = skipQuoted(text, i);
+      continue;
+    }
+    if (ch === '{') depth += 1;
     else if (ch === '}') {
       depth -= 1;
       if (depth === 0) return i;
     }
   }
   return -1;
+}
+
+/**
+ * The index of the closing quote of the string that opens at `i`, or the last
+ * index when the string never closes. A backslash skips the character after
+ * it, so an escaped quote does not end the string.
+ */
+function skipQuoted(text: string, i: number): number {
+  let j = i + 1;
+  while (j < text.length) {
+    const ch = text[j];
+    if (ch === '\\') {
+      j += 2;
+      continue;
+    }
+    if (ch === '"') return j;
+    j += 1;
+  }
+  return text.length - 1;
 }
 
 function stringOf(v: unknown): string {
@@ -214,17 +274,35 @@ function boolOrNull(v: unknown): boolean | null {
   return typeof v === 'boolean' ? v : null;
 }
 
+const WIRES = ['openai', 'anthropic', 'gemini'] as const;
+const AUTH_SCHEMES = ['bearer', 'x-api-key', 'x-goog-api-key', 'none'] as const;
+
+function isWire(v: unknown): v is Wire {
+  return typeof v === 'string' && (WIRES as readonly string[]).includes(v);
+}
+
+function isAuthScheme(v: unknown): v is AuthScheme {
+  return typeof v === 'string' && (AUTH_SCHEMES as readonly string[]).includes(v);
+}
+
 function providerOf(v: unknown): ProviderDirectoryEntry | null {
   if (!isRecord(v)) return null;
   const id = stringOf(v.id);
-  const wire = v.wire === 'openai' || v.wire === 'anthropic' || v.wire === 'gemini' ? v.wire : null;
+  const wire = isWire(v.wire) ? v.wire : null;
   if (id === '' || wire === null) return null;
-  const auth = v.auth === 'bearer' || v.auth === 'x-api-key' || v.auth === 'x-goog-api-key' || v.auth === 'none' ? v.auth : 'bearer';
+  const auth: AuthScheme = isAuthScheme(v.auth) ? v.auth : 'bearer';
   // The brief's directory writes `path` (/p/<id>, joined to $MAKEFUN_ENV_URL); a directory that spells an
   // absolute base instead may use base_path, base_url or base. Take the first non-empty, `path` first.
-  const base =
-    stringOf(v.path) !== '' ? stringOf(v.path) : stringOf(v.base_path) !== '' ? stringOf(v.base_path) : stringOf(v.base_url) !== '' ? stringOf(v.base_url) : stringOf(v.base);
-  return { id, name: stringOf(v.name) !== '' ? stringOf(v.name) : id, wire, auth, base, key_env: stringOf(v.key_env), key: stringOf(v.key) };
+  const base = firstNonEmpty(stringOf(v.path), stringOf(v.base_path), stringOf(v.base_url), stringOf(v.base));
+  return {
+    id,
+    name: firstNonEmpty(stringOf(v.name), id),
+    wire,
+    auth,
+    base,
+    key_env: stringOf(v.key_env),
+    key: stringOf(v.key),
+  };
 }
 
 function ratingOf(v: unknown): RatingRow | null {
@@ -235,31 +313,69 @@ function ratingOf(v: unknown): RatingRow | null {
   return {
     model,
     provider,
-    rating_milli: typeof v.rating_milli === 'number' && Number.isFinite(v.rating_milli) ? v.rating_milli : 0,
+    rating_milli: numberOrNull(v.rating_milli) ?? 0,
     context_length: numberOrNull(v.context_length),
-    tools: v.tools === true,
-    vision: v.vision === true,
-    json: v.json === true,
-    free: v.free === true,
+    tools: isTrue(v.tools),
+    vision: isTrue(v.vision),
+    json: isTrue(v.json),
+    free: isTrue(v.free),
   };
+}
+
+/** The requirements one workload row states; a row that says nothing needs nothing beyond the defaults. */
+function requirementOf(v: unknown): Requirement {
+  const req = isRecord(v) ? v : {};
+  const out: Requirement = {
+    tools: isTrue(req.tools),
+    vision: isTrue(req.vision),
+    json: isTrue(req.json),
+  };
+  const minContext = numberOrNull(req.min_context);
+  if (minContext !== null) out.min_context = minContext;
+  return out;
 }
 
 function workloadRequestOf(v: unknown): WorkloadRequest | null {
   if (!isRecord(v)) return null;
   const id = stringOf(v.id);
   if (id === '') return null;
-  const requires = isRecord(v.requires) ? v.requires : {};
   return {
     id,
     api: v.api === 'anthropic' ? 'anthropic' : 'openai',
-    stream: v.stream === true,
+    stream: isTrue(v.stream),
     weight: v.weight === 2 ? 2 : 1,
-    requires: {
-      tools: requires.tools === true,
-      vision: requires.vision === true,
-      json: requires.json === true,
-      ...(typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {}),
-    },
+    requires: requirementOf(v.requires),
+  };
+}
+
+/** The first document with this `schema` whose `listKey` member is an array, or null. */
+function findDocument(docs: Json[], schema: string, listKey: string): Json | null {
+  return docs.find((d) => d.schema === schema && Array.isArray(d[listKey])) ?? null;
+}
+
+/** The quality table as a RatingsFile, from the document that carries it. */
+function parseRatingsDocument(doc: Json): RatingsFile {
+  const rows = (doc.ratings as unknown[]).flatMap((v) => {
+    const row = ratingOf(v);
+    return row === null ? [] : [row];
+  });
+  const best: { id: string; rating_milli: number }[] = Array.isArray(doc.best)
+    ? doc.best.flatMap((v) => {
+        if (!isRecord(v) || stringOf(v.id) === '') return [];
+        return [{ id: stringOf(v.id), rating_milli: numberOrNull(v.rating_milli) ?? 0 }];
+      })
+    : [];
+  return { schema: RATINGS_SCHEMA, ratings: rows, best };
+}
+
+/** The workload manifest as a WorkloadFile, from the document that carries it. */
+function parseWorkloadDocument(doc: Json): WorkloadFile {
+  return {
+    schema: WORKLOAD_SCHEMA,
+    manifest: (doc.manifest as unknown[]).flatMap((v) => {
+      const request = workloadRequestOf(v);
+      return request === null ? [] : [request];
+    }),
   };
 }
 
@@ -274,43 +390,18 @@ export function readBrief(path: string): Brief {
     return { directory, ratings: null, workload: null, error: `cannot read ${path}: ${(err as Error).message}` };
   }
   const docs = documentsIn(text);
-  const directoryDoc = docs.find((d) => d.schema === PROVIDERS_SCHEMA && Array.isArray(d.providers)) ?? null;
-  if (directoryDoc === null || !Array.isArray(directoryDoc.providers)) {
+  const directoryDoc = findDocument(docs, PROVIDERS_SCHEMA, 'providers');
+  if (directoryDoc === null) {
     return { directory, ratings: null, workload: null, error: `the brief at ${path} holds no ${PROVIDERS_SCHEMA} document` };
   }
-  const providers = directoryDoc.providers.flatMap((v) => {
-    const p = providerOf(v);
-    return p === null ? [] : [p];
+  const providers = (directoryDoc.providers as unknown[]).flatMap((v) => {
+    const entry = providerOf(v);
+    return entry === null ? [] : [entry];
   });
-  const ratingsDoc = docs.find((d) => d.schema === RATINGS_SCHEMA && Array.isArray(d.ratings)) ?? null;
-  const ratingRows = ratingsDoc !== null && Array.isArray(ratingsDoc.ratings) ? ratingsDoc.ratings : null;
-  const ratings: RatingsFile | null =
-    ratingsDoc === null || ratingRows === null
-      ? null
-      : {
-          schema: RATINGS_SCHEMA,
-          ratings: ratingRows.flatMap((v) => {
-            const r = ratingOf(v);
-            return r === null ? [] : [r];
-          }),
-          best: Array.isArray(ratingsDoc.best)
-            ? ratingsDoc.best.flatMap((v) => {
-                if (!isRecord(v) || stringOf(v.id) === '') return [];
-                return [{ id: stringOf(v.id), rating_milli: numberOrNull(v.rating_milli) ?? 0 }];
-              })
-            : [],
-        };
-  const workloadDoc = docs.find((d) => d.schema === WORKLOAD_SCHEMA && Array.isArray(d.manifest)) ?? null;
-  const workload: WorkloadFile | null =
-    workloadDoc === null || !Array.isArray(workloadDoc.manifest)
-      ? null
-      : {
-          schema: WORKLOAD_SCHEMA,
-          manifest: workloadDoc.manifest.flatMap((v) => {
-            const w = workloadRequestOf(v);
-            return w === null ? [] : [w];
-          }),
-        };
+  const ratingsDoc = findDocument(docs, RATINGS_SCHEMA, 'ratings');
+  const ratings = ratingsDoc === null ? null : parseRatingsDocument(ratingsDoc);
+  const workloadDoc = findDocument(docs, WORKLOAD_SCHEMA, 'manifest');
+  const workload = workloadDoc === null ? null : parseWorkloadDocument(workloadDoc);
   return { directory: { schema: PROVIDERS_SCHEMA, providers }, ratings, workload, error: null };
 }
 
@@ -332,33 +423,53 @@ export function modelFree(model: ProbedModel, row: RatingRow | null): boolean {
 /** What a model can do: the quality table's row where it has one, the listing's own fields where it does not. */
 export function capabilitiesOf(model: ProbedModel, row: RatingRow | null): Capabilities {
   return {
-    context_length: row?.context_length ?? model.context_length ?? null,
-    tools: row?.tools ?? model.tools ?? null,
-    vision: row?.vision ?? model.vision ?? null,
-    json: row?.json ?? model.json ?? null,
+    context_length: prefer(row?.context_length, model.context_length),
+    tools: prefer(row?.tools, model.tools),
+    vision: prefer(row?.vision, model.vision),
+    json: prefer(row?.json, model.json),
   };
 }
 
 /** Whether a model's capabilities meet one request's requirements. An unknown capability never meets one. */
 export function meetsRequirements(requires: Requirement, caps: Capabilities): boolean {
-  if (requires.tools === true && caps.tools !== true) return false;
-  if (requires.vision === true && caps.vision !== true) return false;
-  if (requires.json === true && caps.json !== true) return false;
+  const capabilityChecks: [needed: boolean | undefined, actual: boolean | null][] = [
+    [requires.tools, caps.tools],
+    [requires.vision, caps.vision],
+    [requires.json, caps.json],
+  ];
+  for (const [needed, actual] of capabilityChecks) {
+    if (needed === true && actual !== true) return false;
+  }
   if (requires.min_context !== undefined && (caps.context_length === null || caps.context_length < requires.min_context)) return false;
   return true;
+}
+
+/** The numeric values a listing's `pricing` member states (strings are read as numbers). */
+function priceValues(pricing: Json): number[] {
+  return Object.values(pricing).flatMap((x) => {
+    if (typeof x === 'number') return [x];
+    if (typeof x === 'string' && x.trim() !== '') return [Number(x)];
+    return [];
+  });
 }
 
 /** A price field of a listing: 0 when every price is zero, null when the listing says nothing about price. */
 function zeroPriced(v: Json): boolean | null {
   const pricing = isRecord(v.pricing) ? v.pricing : null;
   if (pricing === null) return null;
-  const values = Object.values(pricing).flatMap((x) => {
-    if (typeof x === 'number') return [x];
-    if (typeof x === 'string' && x.trim() !== '') return [Number(x)];
-    return [];
-  });
+  const values = priceValues(pricing);
   if (values.length === 0) return null;
   return values.every((n) => Number.isFinite(n) && n === 0);
+}
+
+/** The name a listing gives a model, falling back through the wire's spellings to the id itself. */
+function modelDisplayName(v: Json, fallback: string): string {
+  return firstNonEmpty(stringOf(v.display_name), stringOf(v.displayName), fallback);
+}
+
+/** A listing's context length, under whichever of the wires' names it uses. */
+function modelContextLength(v: Json): number | null {
+  return prefer(numberOrNull(v.context_length), numberOrNull(v.context_window), numberOrNull(v.inputTokenLimit));
 }
 
 /** One model as a listing wrote it, in whichever wire's spelling. */
@@ -366,12 +477,11 @@ function modelIn(wire: Wire, v: unknown): ProbedModel | null {
   if (!isRecord(v)) return null;
   const id = wire === 'gemini' ? stringOf(v.name).replace(/^models\//, '') : stringOf(v.id);
   if (id === '') return null;
-  const context = numberOrNull(v.context_length) ?? numberOrNull(v.context_window) ?? numberOrNull(v.inputTokenLimit);
   return {
     id,
-    display_name: stringOf(v.display_name) !== '' ? stringOf(v.display_name) : stringOf(v.displayName) !== '' ? stringOf(v.displayName) : id,
-    free: boolOrNull(v.free) ?? zeroPriced(v),
-    context_length: context,
+    display_name: modelDisplayName(v, id),
+    free: prefer(boolOrNull(v.free), zeroPriced(v)),
+    context_length: modelContextLength(v),
     tools: boolOrNull(v.tools),
     vision: boolOrNull(v.vision),
     json: boolOrNull(v.json),
@@ -384,18 +494,24 @@ function modelsIn(wire: Wire, body: unknown): ProbedModel[] {
   const list = wire === 'gemini' ? body.models : body.data;
   if (!Array.isArray(list)) return [];
   return list.flatMap((v) => {
-    const m = modelIn(wire, v);
-    return m === null ? [] : [m];
+    const model = modelIn(wire, v);
+    return model === null ? [] : [model];
   });
+}
+
+/** The URL and headers one provider's catalog probe uses, in its own wire. */
+function probeTarget(envUrl: string, provider: ProviderDirectoryEntry): { url: string; headers: Record<string, string> } {
+  const base = joinBase(envUrl, provider.base);
+  const url = provider.wire === 'gemini' ? `${base}/v1beta/models` : `${base}/v1/models`;
+  const headers: Record<string, string> = { accept: 'application/json', ...authHeaders(provider.auth, provider.key) };
+  if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+  return { url, headers };
 }
 
 /** Probe one provider's catalog route, in its own wire, tolerating every failure. Retries once: a
  * missing provider costs the catalog its four checks, and a slow first probe is not worth that. */
 export async function probeProvider(envUrl: string, provider: ProviderDirectoryEntry, timeoutMs = 5000): Promise<Probe> {
-  const base = joinBase(envUrl, provider.base);
-  const url = provider.wire === 'gemini' ? `${base}/v1beta/models` : `${base}/v1/models`;
-  const headers: Record<string, string> = { accept: 'application/json', ...authHeaders(provider.auth, provider.key) };
-  if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+  const { url, headers } = probeTarget(envUrl, provider);
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
@@ -414,6 +530,24 @@ export async function probeProvider(envUrl: string, provider: ProviderDirectoryE
 }
 
 /**
+ * The models one probed provider contributes to the catalog, in the listing's
+ * own order and with each id once. The listing's order is kept, never sorted:
+ * the scorer compares the free-model list to the truth in order, and the truth
+ * lists them in the provider's own order (the order the catalog route gave).
+ */
+function catalogModelsFor(probe: Probe, ratings: RatingsFile | null): CatalogModel[] {
+  const seen = new Set<string>();
+  const models: CatalogModel[] = [];
+  for (const model of probe.models) {
+    if (seen.has(model.id)) continue;
+    seen.add(model.id);
+    const row = ratingOfModel(ratings, probe.provider.id, model.id);
+    models.push({ id: model.id, free: modelFree(model, row), context_length: prefer(row?.context_length, model.context_length) });
+  }
+  return models;
+}
+
+/**
  * The catalog the probes and the quality table make: every provider that answered, every model it listed.
  *
  * Its base_url is the directory's own path (`/p/<id>`), never the path joined to `envUrl`: the env's
@@ -426,17 +560,13 @@ export function buildCatalog(_envUrl: string, probes: readonly Probe[], ratings:
   const providers: CatalogProvider[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
-    const seen = new Set<string>();
-    const models: CatalogModel[] = [];
-    // Keep the listing's order, never sort: the scorer compares the free-model list to the truth in
-    // order, and the truth lists them in the provider's own order (the order the catalog route gave).
-    for (const model of probe.models) {
-      if (seen.has(model.id)) continue;
-      seen.add(model.id);
-      const row = ratingOfModel(ratings, probe.provider.id, model.id);
-      models.push({ id: model.id, free: modelFree(model, row), context_length: row?.context_length ?? model.context_length ?? null });
-    }
-    providers.push({ id: probe.provider.id, base_url: probe.provider.base, key_env: probe.provider.key_env, wire: probe.provider.wire, models });
+    providers.push({
+      id: probe.provider.id,
+      base_url: probe.provider.base,
+      key_env: probe.provider.key_env,
+      wire: probe.provider.wire,
+      models: catalogModelsFor(probe, ratings),
+    });
   }
   return { providers };
 }
